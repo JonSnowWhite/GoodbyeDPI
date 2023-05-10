@@ -19,6 +19,7 @@
 #include "ttltrack.h"
 #include "blackwhitelist.h"
 #include "fakepackets.h"
+#include "tls.h"
 
 // My mingw installation does not load inet_pton definition for some reason
 WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pAddr);
@@ -387,48 +388,136 @@ static int find_header_and_get_info(const char *pktdata, unsigned int pktlen,
     return FALSE;
 }
 
+static int contains_tls_record_with_client_hello(const char* pktdata, unsigned int pktlen) {
+    // check min header sizes
+    if (pktlen < TLS_RECORD_HEADER_SIZE + TLS_MESSAGE_HEADER_SIZE) {
+        debug("Packet too small for TLS record and message header\n");
+         return FALSE;
+    }
+    // check content type handshake
+    if (pktdata[0] != TLS_CONTENT_TYPE_HANDSHAKE) {
+        debug("Packet does not contain TLS handshake\n");
+        return FALSE;
+    }
+    // check if record header matches any TLS version
+    if ( 
+        // TLS 1.0 Version is also used for backwards compatibility
+        memcmp(pktdata+1, TLS_1_0_VERSION, TLS_VERSION_LENGTH) == 1 &&
+        memcmp(pktdata+1, TLS_1_1_VERSION, TLS_VERSION_LENGTH) == 1 &&
+        memcmp(pktdata+1, TLS_1_2_AND_1_3_VERSION, TLS_VERSION_LENGTH) == 1) {
+        debug("Packet does not contain TLS 1.0, 1.1, 1.2 or 1.3\n");
+        return FALSE;
+    }
+    // check if handshake message contains client hello
+    if (pktdata[5] != TLS_HANDSHAKE_TYPE_CLIENT_HELLO) {
+        debug("Packet does not contain TLS client hello\n");
+        return FALSE;
+    }
+    // looks good otherwise
+    return TRUE;
+}
+
 /**
- * Very crude Server Name Indication (TLS ClientHello hostname) extractor.
+ * Extracts the (first) hostname in the SNI of the given packet. Assumes that the packet is a TLS Client Hello.
  */
 static int extract_sni(const char *pktdata, unsigned int pktlen,
                     char **hostnameaddr, unsigned int *hostnamelen) {
-    unsigned int ptr = 0;
+    
     unsigned const char *d = (unsigned const char *)pktdata;
-    unsigned const char *hnaddr = 0;
-    int hnlen = 0;
+    unsigned const char *host_name_address = 0;
+    unsigned int host_name_length = 0;
 
-    while (ptr + 8 < pktlen) {
-        /* Search for specific Extensions sequence */
-        if (d[ptr] == '\0' && d[ptr+1] == '\0' && d[ptr+2] == '\0' &&
-            d[ptr+4] == '\0' && d[ptr+6] == '\0' && d[ptr+7] == '\0' &&
-            /* Check Extension length, Server Name list length
-            *  and Server Name length relations
-            */
-            d[ptr+3] - d[ptr+5] == 2 && d[ptr+5] - d[ptr+8] == 3)
-            {
-                if (ptr + 8 + d[ptr+8] > pktlen) {
-                    return FALSE;
-                }
-                hnaddr = &d[ptr+9];
-                hnlen = d[ptr+8];
-                /* Limit hostname size up to 253 bytes */
-                if (hnlen < 3 || hnlen > HOST_MAXLEN) {
-                    return FALSE;
-                }
-                /* Validate that hostname has only ascii lowercase characters */
-                for (int i=0; i<hnlen; i++) {
-                    if (!( (hnaddr[i] >= '0' && hnaddr[i] <= '9') ||
-                         (hnaddr[i] >= 'a' && hnaddr[i] <= 'z') ||
-                         hnaddr[i] == '.' || hnaddr[i] == '-'))
-                    {
-                        return FALSE;
-                    }
-                }
-                *hostnameaddr = (char*)hnaddr;
-                *hostnamelen = (unsigned int)hnlen;
-                return TRUE;
+    // offset for first length_field to parse
+    unsigned int p = TLS_RECORD_HEADER_SIZE + TLS_MESSAGE_HEADER_SIZE + TLS_VERSION_LENGTH + TLS_RANDOM_LENGTH;
+
+    if (p + TLS_SESSION_ID_LENGTH >= pktlen) {
+        debug("Packet too small for header\n");
+        return FALSE;
+    }
+
+    // skip session id
+    unsigned int session_id_length = d[p];
+    p += (session_id_length + TLS_SESSION_ID_LENGTH);
+
+    if (p + TLS_CIPHER_SUITES_LENGTH >= pktlen) {
+        debug("Packet too small for session id\n");
+        return FALSE;
+    }
+
+    // skip cipher suites
+    unsigned int cipher_suites_length = (unsigned int)(d[p] << 8) + d[p+1];
+    p += (cipher_suites_length + TLS_CIPHER_SUITES_LENGTH);
+
+    if (p + TLS_COMPRESSION_METHODS_LENGTH >= pktlen) {
+        debug("Packet too small for cipher suites\n");
+        return FALSE;
+    }
+
+    // skip compression methods
+    unsigned int compression_methods_length = d[p];
+    p += (compression_methods_length + TLS_COMPRESSION_METHODS_LENGTH);
+
+    if (p + TLS_EXTENSIONS_LENGTH >= pktlen) {
+        debug("Packet too small for compression methods\n");
+        return FALSE;
+    }
+
+    unsigned int extensions_length = (unsigned int)(d[p] << 8) + d[p+1];
+    p += TLS_EXTENSIONS_LENGTH;
+
+    while (p + TLS_EXTENSION_TYPE_LENGTH + TLS_EXTENSION_LENGTH_LENGTH < min(pktlen, p + extensions_length)) {
+
+        if (memcmp(d+p, TLS_EXTENSION_TYPE_SERVER_NAME, TLS_EXTENSION_TYPE_LENGTH) == 0) {
+            // finally extract sni
+            p += TLS_EXTENSION_TYPE_LENGTH + TLS_EXTENSION_LENGTH_LENGTH;
+            
+            if (p + TLS_SNI_HEADER_LENGTH >= pktlen) {
+                debug("Packet too small for extension header\n");
+                return FALSE;
             }
-        ptr++;
+            unsigned int host_name_type = d[p+TLS_EXTENSION_TYPE_LENGTH];
+            
+            if (host_name_type != TLS_SNI_HOST_NAME_TYPE) {
+                debug("SNI type is not host name\n");
+                return FALSE;
+            }
+
+            host_name_length = (unsigned int)(d[p + TLS_EXTENSION_TYPE_LENGTH + 1] << 8) + d[p + TLS_EXTENSION_TYPE_LENGTH + 2];
+            p += TLS_SNI_HEADER_LENGTH;
+
+            if (p + host_name_length >= pktlen) {
+                debug("Packet too small for host name\n");
+                return FALSE;
+            }
+
+            host_name_address = &d[p];
+            /* Limit hostname size up to 253 bytes */
+            if (host_name_length < 3) {
+                debug("Host name too short\n");
+                return FALSE;
+            } else if (host_name_length > HOST_MAXLEN) {
+                debug("Host name too long\n");
+                return FALSE;
+            }
+
+            *hostnameaddr = (char*)host_name_address;
+            *hostnamelen = host_name_length;
+
+            // TODO: is this necessary? if yes: why? domain names are case insensitive
+            /* for (int i=0; i<hnlen; i++) {
+                if (!( (hnaddr[i] >= '0' && hnaddr[i] <= '9') ||
+                        (hnaddr[i] >= 'a' && hnaddr[i] <= 'z') ||
+                        hnaddr[i] == '.' || hnaddr[i] == '-'))
+                {
+                    return FALSE;
+                }
+            } */
+            return TRUE;
+        } else {
+            // skip extension
+            unsigned int extension_length = (unsigned int)(d[p+TLS_EXTENSION_TYPE_LENGTH] << 8) + d[p+TLS_EXTENSION_TYPE_LENGTH+1];
+            p += TLS_EXTENSION_TYPE_LENGTH + TLS_EXTENSION_LENGTH_LENGTH + extension_length;
+        }
     }
     return FALSE;
 }
@@ -462,20 +551,76 @@ static PVOID find_http_method_end(const char *pkt, unsigned int http_frag, int *
     return NULL;
 }
 
+/**
+* Do TLS record fragmentation on TLS packet.
+* Works analogously to send_native_fragments() as it cuts off
+* either the beginning or the end of the packet
+*/
+static void record_frag_packet(UINT packetLen, const char *packet_data, UINT packet_dataLen,
+                        char *new_packet_data, UINT *new_packet_data_len, UINT *new_packet_len, UINT fragment_size, int packet_v4, int packet_v6, PWINDIVERT_IPHDR ppIpHdr, PWINDIVERT_IPV6HDR ppIpV6Hdr) {
+
+    unsigned int p = 0;
+
+    // get record length
+    UINT record_len = (UINT)(packet_data[TLS_CONTENT_TYPE_LENGTH + TLS_VERSION_LENGTH] << 8) + (UINT)packet_data[TLS_CONTENT_TYPE_LENGTH + TLS_VERSION_LENGTH + 1];
+
+    if (fragment_size >= record_len) {
+        debug("Fragment size larger than or equal to record size\n");
+        memcpy(new_packet_data,packet_data,packet_dataLen);
+        *new_packet_data_len = packet_dataLen;
+        *new_packet_len = packetLen;
+        return;
+    }
+
+    // prepare first header with fragment size length
+    memcpy(new_packet_data, packet_data, TLS_RECORD_HEADER_SIZE);
+    new_packet_data[TLS_CONTENT_TYPE_LENGTH + TLS_VERSION_LENGTH] = (fragment_size >> 8) & 0xFF;
+    new_packet_data[TLS_CONTENT_TYPE_LENGTH + TLS_VERSION_LENGTH + 1] = fragment_size & 0xFF;
+    p += TLS_RECORD_HEADER_SIZE;
+
+    // copy first record data into buffer
+    memcpy(new_packet_data + p, packet_data + TLS_RECORD_HEADER_SIZE, fragment_size);
+    p += fragment_size;
+
+    // prepare second second header with record size - fragment size length
+    memcpy(new_packet_data + p, packet_data, TLS_RECORD_HEADER_SIZE);
+    new_packet_data[p + TLS_CONTENT_TYPE_LENGTH + TLS_VERSION_LENGTH] = ((record_len - fragment_size) >> 8) & 0xFF;
+    new_packet_data[p + TLS_CONTENT_TYPE_LENGTH + TLS_VERSION_LENGTH + 1] = (record_len - fragment_size) & 0xFF;
+    p += TLS_RECORD_HEADER_SIZE;
+
+    // copy second record data into buffer
+    memcpy(new_packet_data + p, packet_data + TLS_RECORD_HEADER_SIZE + fragment_size, record_len - fragment_size);
+    p += record_len - fragment_size;
+
+    if (packet_v4) {
+            ppIpHdr->Length = htons(
+                ntohs(ppIpHdr->Length) + TLS_RECORD_HEADER_SIZE
+            );
+    }
+    else if (packet_v6)
+        ppIpV6Hdr->Length = htons(
+            ntohs(ppIpV6Hdr->Length) + TLS_RECORD_HEADER_SIZE
+        );
+        
+    *new_packet_data_len = packet_dataLen + TLS_RECORD_HEADER_SIZE;
+    *new_packet_len = packetLen + TLS_RECORD_HEADER_SIZE;
+
+}
+
 /** Fragment and send the packet.
  *
  * This function cuts off the end of the packet (step=0) or
  * the beginning of the packet (step=1) with fragment_size bytes.
  */
 static void send_native_fragment(HANDLE w_filter, WINDIVERT_ADDRESS addr,
-                        char *packet, UINT packetLen, PVOID packet_data,
+                        char *packet, UINT orig_packetLen, UINT packetLen,
+                        PVOID oldpacket_data, PVOID packet_data,
                         UINT packet_dataLen, int packet_v4, int packet_v6,
                         PWINDIVERT_IPHDR ppIpHdr, PWINDIVERT_IPV6HDR ppIpV6Hdr,
                         PWINDIVERT_TCPHDR ppTcpHdr,
                         unsigned int fragment_size, int step) {
     char packet_bak[MAX_PACKET_SIZE];
-    memcpy(packet_bak, packet, packetLen);
-    UINT orig_packetLen = packetLen;
+    memcpy(packet_bak, packet, orig_packetLen);
 
     if (fragment_size >= packet_dataLen) {
         if (step == 1)
@@ -499,6 +644,9 @@ static void send_native_fragment(HANDLE w_filter, WINDIVERT_ADDRESS addr,
         //                packet_v4, packet_v6, ntohs(ppIpHdr->Length),
         //                packetLen, packetLen - packet_dataLen + fragment_size);
         packetLen = packetLen - packet_dataLen + fragment_size;
+        memmove(oldpacket_data,
+                (char*)packet_data,
+                fragment_size);
     }
 
     else if (step == 1) {
@@ -512,9 +660,10 @@ static void send_native_fragment(HANDLE w_filter, WINDIVERT_ADDRESS addr,
             );
         //printf("step1 (%d:%d), pp:%d, was:%d, now:%d\n", packet_v4, packet_v6, ntohs(ppIpHdr->Length),
         //                packetLen, packetLen - fragment_size);
-        memmove(packet_data,
+        memmove(oldpacket_data,
                 (char*)packet_data + fragment_size,
                 packet_dataLen - fragment_size);
+                
         packetLen -= fragment_size;
 
         ppTcpHdr->SeqNum = htonl(ntohl(ppTcpHdr->SeqNum) + fragment_size);
@@ -561,7 +710,8 @@ int main(int argc, char *argv[]) {
     int do_passivedpi = 0, do_fragment_http = 0,
         do_fragment_http_persistent = 0,
         do_fragment_http_persistent_nowait = 0,
-        do_fragment_https = 0, do_host = 0,
+        do_fragment_https_tcp = 0,
+        do_fragment_https_tls = 0, do_host = 0,
         do_host_removespace = 0, do_additional_space = 0,
         do_http_allports = 0,
         do_host_mixedcase = 0,
@@ -630,7 +780,7 @@ int main(int argc, char *argv[]) {
 
     if (argc == 1) {
         /* enable mode -5 by default */
-        do_fragment_http = do_fragment_https = 1;
+        do_fragment_http = do_fragment_https_tcp = do_fragment_https_tls = 1;
         do_reverse_frag = do_native_frag = 1;
         http_fragment_size = https_fragment_size = 2;
         do_fragment_http_persistent = do_fragment_http_persistent_nowait = 1;
@@ -639,31 +789,34 @@ int main(int argc, char *argv[]) {
         max_payload_size = 1200;
     }
 
-    while ((opt = getopt_long(argc, argv, "123456prsaf:e:mwk:n", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "123456prsaf:el:mwk:n", long_options, NULL)) != -1) {
         switch (opt) {
             case '1':
                 do_passivedpi = do_host = do_host_removespace \
-                = do_fragment_http = do_fragment_https \
+                = do_fragment_http = do_fragment_https_tcp \
+                = do_fragment_https_tls \
                 = do_fragment_http_persistent \
                 = do_fragment_http_persistent_nowait = 1;
                 break;
             case '2':
                 do_passivedpi = do_host = do_host_removespace \
-                = do_fragment_http = do_fragment_https \
+                = do_fragment_http = do_fragment_https_tcp \
+                = do_fragment_https_tls \
                 = do_fragment_http_persistent \
                 = do_fragment_http_persistent_nowait = 1;
                 https_fragment_size = 40u;
                 break;
             case '3':
                 do_passivedpi = do_host = do_host_removespace \
-                = do_fragment_https = 1;
+                = do_fragment_https_tcp \
+                = do_fragment_https_tls = 1;
                 https_fragment_size = 40u;
                 break;
             case '4':
                 do_passivedpi = do_host = do_host_removespace = 1;
                 break;
             case '5':
-                do_fragment_http = do_fragment_https = 1;
+                do_fragment_http = do_fragment_https_tcp = do_fragment_https_tls = 1;
                 do_reverse_frag = do_native_frag = 1;
                 http_fragment_size = https_fragment_size = 2;
                 do_fragment_http_persistent = do_fragment_http_persistent_nowait = 1;
@@ -672,7 +825,7 @@ int main(int argc, char *argv[]) {
                 max_payload_size = 1200;
                 break;
             case '6':
-                do_fragment_http = do_fragment_https = 1;
+                do_fragment_http = do_fragment_https_tcp = do_fragment_https_tls = 1;
                 do_reverse_frag = do_native_frag = 1;
                 http_fragment_size = https_fragment_size = 2;
                 do_fragment_http_persistent = do_fragment_http_persistent_nowait = 1;
@@ -711,7 +864,11 @@ int main(int argc, char *argv[]) {
                 do_native_frag = 1;
                 break;
             case 'e':
-                do_fragment_https = 1;
+                do_fragment_https_tcp = 1;
+                https_fragment_size = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
+                break;
+            case 'l':
+                do_fragment_https_tls = 1;
                 https_fragment_size = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
                 break;
             case 'w':
@@ -886,7 +1043,8 @@ int main(int argc, char *argv[]) {
                 " -f <value>  set HTTP fragmentation to value\n"
                 " -k <value>  enable HTTP persistent (keep-alive) fragmentation and set it to value\n"
                 " -n          do not wait for first segment ACK when -k is enabled\n"
-                " -e <value>  set HTTPS fragmentation to value\n"
+                " -e <value>  set HTTPS TCP fragmentation to value\n"
+                " -l <value>  set HTTPS TLS fragmentation to value\n"
                 " -w          try to find and parse HTTP traffic on all processed ports (not only on port 80)\n"
                 " --port        <value>    additional TCP port to perform fragmentation on (and HTTP tricks with -w)\n"
                 " --ip-id       <value>    handle additional IP ID (decimal, drop redirects and TCP RSTs with this ID).\n"
@@ -956,7 +1114,8 @@ int main(int argc, char *argv[]) {
     printf("Block passive: %d\n"                    /* 1 */
            "Fragment HTTP: %u\n"                    /* 2 */
            "Fragment persistent HTTP: %u\n"         /* 3 */
-           "Fragment HTTPS: %u\n"                   /* 4 */
+           "Fragment HTTPS TCP: %u\n"               /* 4 */
+           "Fragment HTTPS TLS: %u\n"               /* 4.5 */
            "Native fragmentation (splitting): %d\n" /* 5 */
            "Fragments sending in reverse: %d\n"     /* 6 */
            "hoSt: %d\n"                             /* 7 */
@@ -975,7 +1134,8 @@ int main(int argc, char *argv[]) {
            do_passivedpi,                                         /* 1 */
            (do_fragment_http ? http_fragment_size : 0),           /* 2 */
            (do_fragment_http_persistent ? http_fragment_size : 0),/* 3 */
-           (do_fragment_https ? https_fragment_size : 0),         /* 4 */
+           (do_fragment_https_tcp ? https_fragment_size : 0),         /* 4 */
+           (do_fragment_https_tls ? https_fragment_size : 0),         /* 4.5 */
            do_native_frag,        /* 5 */
            do_reverse_frag,       /* 6 */
            do_host,               /* 7 */
@@ -1001,7 +1161,7 @@ int main(int argc, char *argv[]) {
              "completely.");
     }
 
-    if (do_native_frag && !(do_fragment_http || do_fragment_https)) {
+    if (do_native_frag && !(do_fragment_http || do_fragment_https_tcp || do_fragment_https_tls)) {
         puts("\nERROR: Native fragmentation is enabled but fragment sizes are not set.\n"
              "Fragmentation has no effect.");
         die();
@@ -1042,8 +1202,8 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         if (WinDivertRecv(w_filter, packet, sizeof(packet), &packetLen, &addr)) {
-            debug("Got %s packet, len=%d!\n", addr.Outbound ? "outbound" : "inbound",
-                   packetLen);
+            //debug("Got %s packet, len=%d!\n", addr.Outbound ? "outbound" : "inbound",
+            //       packetLen);
             should_reinject = 1;
             should_recalc_checksum = 0;
 
@@ -1086,7 +1246,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            debug("packet_type: %d, packet_v4: %d, packet_v6: %d\n", packet_type, packet_v4, packet_v6);
+            //debug("packet_type: %d, packet_v4: %d, packet_v6: %d\n", packet_type, packet_v4, packet_v6);
 
             if (packet_type == ipv4_tcp_data || packet_type == ipv6_tcp_data) {
                 //printf("Got parsed packet, len=%d!\n", packet_dataLen);
@@ -1118,7 +1278,8 @@ int main(int argc, char *argv[]) {
                  * TLS handshake, send fake request.
                  */
                 else if (addr.Outbound &&
-                        ((do_fragment_https ? packet_dataLen == https_fragment_size : 0) ||
+                        ((do_fragment_https_tcp ? packet_dataLen == https_fragment_size : 0) ||
+                         (do_fragment_https_tls ? packet_dataLen == https_fragment_size : 0) ||
                          packet_dataLen > 16) &&
                          ppTcpHdr->DstPort != htons(80) &&
                          (do_fake_packet || do_native_frag)
@@ -1128,9 +1289,11 @@ int main(int argc, char *argv[]) {
                      * In case of Window Size fragmentation=2, we'll receive only 2 byte packet.
                      * But if the packet is more than 2 bytes, check ClientHello byte.
                     */
-                    if ((packet_dataLen == 2 && memcmp(packet_data, "\x16\x03", 2) == 0) ||
-                        (packet_dataLen >= 3 && memcmp(packet_data, "\x16\x03\x01", 3) == 0))
-                    {
+                    if (
+                        // TODO: feedback on when this triggers and whether this is necessary, if we cannot check for sni do we want to circumvent?
+                        (packet_dataLen == 2 && memcmp(packet_data, "\x16\x03", 2) == 0) ||
+                        (packet_dataLen >= 3 && contains_tls_record_with_client_hello(packet_data, packet_dataLen)))
+                    {   
                         if (do_blacklist) {
                             sni_ok = extract_sni(packet_data, packet_dataLen,
                                         &host_addr, &host_len);
@@ -1283,20 +1446,66 @@ int main(int argc, char *argv[]) {
                     if (do_fragment_http && ppTcpHdr->DstPort == htons(80)) {
                         current_fragment_size = http_fragment_size;
                     }
-                    else if (do_fragment_https && ppTcpHdr->DstPort != htons(80)) {
+                    else if ((do_fragment_https_tcp || do_fragment_https_tls) && ppTcpHdr->DstPort != htons(80)) {
                         current_fragment_size = https_fragment_size;
                     }
 
                     if (current_fragment_size) {
-                        send_native_fragment(w_filter, addr, packet, packetLen, packet_data,
-                                            packet_dataLen,packet_v4, packet_v6,
-                                            ppIpHdr, ppIpV6Hdr, ppTcpHdr,
-                                            current_fragment_size, do_reverse_frag);
+                        
+                        
+                        char new_packet[MAX_PACKET_SIZE + TLS_RECORD_HEADER_SIZE];
+                        unsigned int new_packet_data_len;
+                        unsigned int new_packet_len;
 
-                        send_native_fragment(w_filter, addr, packet, packetLen, packet_data,
-                                            packet_dataLen,packet_v4, packet_v6,
-                                            ppIpHdr, ppIpV6Hdr, ppTcpHdr,
-                                            current_fragment_size, !do_reverse_frag);
+                        /*
+                        * Record Fragmentation
+                        */
+                        if (do_fragment_https_tls) {
+                            debug("Fragmenting TLS records\n");
+                            record_frag_packet(packetLen, packet_data, packet_dataLen, new_packet,
+                                                &new_packet_data_len, &new_packet_len, current_fragment_size,packet_v4, 
+                                                packet_v6, ppIpHdr, ppIpV6Hdr);
+                        } else {
+                            memcpy(new_packet, packet_data, packet_dataLen);
+                            new_packet_data_len = packet_dataLen;
+                            new_packet_len = packetLen;
+                        }
+
+                        /*
+                        * TCP Fragmentation
+                        */
+                        if (do_fragment_https_tcp || new_packet_data_len > MAX_PACKET_SIZE) {
+                            debug("Fragmenting TCP\n");
+                            // make sure that added record header is always fragmented
+                            UINT actual_fragment_size;
+                            if (new_packet_data_len > MAX_PACKET_SIZE) {
+                                actual_fragment_size = max(new_packet_data_len - MAX_PACKET_SIZE, https_fragment_size);
+                            } else {
+                                actual_fragment_size = https_fragment_size;
+                            }
+
+                            send_native_fragment(w_filter, addr, packet, packetLen,
+                                                new_packet_len, packet_data, 
+                                                new_packet,
+                                                new_packet_data_len,packet_v4, packet_v6,
+                                                ppIpHdr, ppIpV6Hdr, ppTcpHdr,
+                                                actual_fragment_size, do_reverse_frag);
+
+                            send_native_fragment(w_filter, addr, packet, packetLen,
+                                                new_packet_len, packet_data,
+                                                new_packet,
+                                                new_packet_data_len,packet_v4, packet_v6,
+                                                ppIpHdr, ppIpV6Hdr, ppTcpHdr,
+                                                actual_fragment_size, !do_reverse_frag);
+                        } else {
+                            // send out unchanged
+                            send_native_fragment(w_filter, addr, packet, packetLen,
+                                                new_packet_len, packet_data,
+                                                new_packet,
+                                                new_packet_data_len,packet_v4, packet_v6,
+                                                ppIpHdr, ppIpV6Hdr, ppTcpHdr,
+                                                new_packet_data_len, 1);
+                        }
                         continue;
                     }
                 }
@@ -1333,7 +1542,7 @@ int main(int argc, char *argv[]) {
                             change_window_size(ppTcpHdr, http_fragment_size);
                             should_recalc_checksum = 1;
                         }
-                        else if (do_fragment_https && ppTcpHdr->SrcPort != htons(80)) {
+                        else if ((do_fragment_https_tcp || do_fragment_https_tls) && ppTcpHdr->SrcPort != htons(80)) {
                             change_window_size(ppTcpHdr, https_fragment_size);
                             should_recalc_checksum = 1;
                         }
